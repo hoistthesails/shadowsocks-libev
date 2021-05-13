@@ -2,7 +2,7 @@
  * redir.c - Provide a transparent TCP proxy through remote shadowsocks
  *           server
  *
- * Copyright (C) 2013 - 2018, Max Lv <max.c.lv@gmail.com>
+ * Copyright (C) 2013 - 2019, Max Lv <max.c.lv@gmail.com>
  *
  * This file is part of the shadowsocks-libev.
  *
@@ -61,12 +61,16 @@
 #define EWOULDBLOCK EAGAIN
 #endif
 
-#ifndef BUF_SIZE
-#define BUF_SIZE 2048
-#endif
-
 #ifndef IP6T_SO_ORIGINAL_DST
 #define IP6T_SO_ORIGINAL_DST 80
+#endif
+
+#ifndef IP_TRANSPARENT
+#define IP_TRANSPARENT       19
+#endif
+
+#ifndef IPV6_TRANSPARENT
+#define IPV6_TRANSPARENT     75
 #endif
 
 static void accept_cb(EV_P_ ev_io *w, int revents);
@@ -85,6 +89,10 @@ static void close_and_free_server(EV_P_ server_t *server);
 
 int verbose    = 0;
 int reuse_port = 0;
+int tcp_incoming_sndbuf = 0;
+int tcp_incoming_rcvbuf = 0;
+int tcp_outgoing_sndbuf = 0;
+int tcp_outgoing_rcvbuf = 0;
 
 static crypto_t *crypto;
 
@@ -93,13 +101,15 @@ static int mode      = TCP_ONLY;
 #ifdef HAVE_SETRLIMIT
 static int nofile = 0;
 #endif
-static int fast_open = 0;
-static int no_delay  = 0;
-static int ret_val   = 0;
+int fast_open       = 0;
+static int no_delay = 0;
+static int ret_val  = 0;
 
 static struct ev_signal sigint_watcher;
 static struct ev_signal sigterm_watcher;
 static struct ev_signal sigchld_watcher;
+
+static int tcp_tproxy = 0; /* use tproxy instead of redirect (for tcp) */
 
 static int
 getdestaddr(int fd, struct sockaddr_storage *destaddr)
@@ -107,12 +117,17 @@ getdestaddr(int fd, struct sockaddr_storage *destaddr)
     socklen_t socklen = sizeof(*destaddr);
     int error         = 0;
 
-    error = getsockopt(fd, SOL_IPV6, IP6T_SO_ORIGINAL_DST, destaddr, &socklen);
-    if (error) { // Didn't find a proper way to detect IP version.
-        error = getsockopt(fd, SOL_IP, SO_ORIGINAL_DST, destaddr, &socklen);
-        if (error) {
-            return -1;
+    if (tcp_tproxy) {
+        error = getsockname(fd, (void *)destaddr, &socklen);
+    } else {
+        error = getsockopt(fd, SOL_IPV6, IP6T_SO_ORIGINAL_DST, destaddr, &socklen);
+        if (error) { // Didn't find a proper way to detect IP version.
+            error = getsockopt(fd, SOL_IP, SO_ORIGINAL_DST, destaddr, &socklen);
         }
+    }
+
+    if (error) {
+        return -1;
     }
     return 0;
 }
@@ -169,6 +184,23 @@ create_and_bind(const char *addr, const char *port)
             }
         }
 
+        if (tcp_tproxy) {
+            int level = 0, optname = 0;
+            if (rp->ai_family == AF_INET) {
+                level = IPPROTO_IP;
+                optname = IP_TRANSPARENT;
+            } else {
+                level = IPPROTO_IPV6;
+                optname = IPV6_TRANSPARENT;
+            }
+
+            if (setsockopt(listen_sock, level, optname, &opt, sizeof(opt)) != 0) {
+                ERROR("setsockopt IP_TRANSPARENT");
+                exit(EXIT_FAILURE);
+            }
+            LOGI("tcp tproxy mode enabled");
+        }
+
         s = bind(listen_sock, rp->ai_addr, rp->ai_addrlen);
         if (s == 0) {
             /* We managed to bind successfully! */
@@ -196,7 +228,7 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
     ev_timer_stop(EV_A_ & server->delayed_connect_watcher);
 
     ssize_t r = recv(server->fd, remote->buf->data + remote->buf->len,
-                     BUF_SIZE - remote->buf->len, 0);
+                     SOCKET_BUF_SIZE - remote->buf->len, 0);
 
     if (r == 0) {
         // connection closed
@@ -242,7 +274,7 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
         return;
     }
 
-    int err = crypto->encrypt(remote->buf, server->e_ctx, BUF_SIZE);
+    int err = crypto->encrypt(remote->buf, server->e_ctx, SOCKET_BUF_SIZE);
 
     if (err) {
         LOGE("invalid password or cipher");
@@ -361,9 +393,7 @@ remote_recv_cb(EV_P_ ev_io *w, int revents)
     remote_t *remote              = remote_recv_ctx->remote;
     server_t *server              = remote->server;
 
-    ev_timer_again(EV_A_ & remote->recv_ctx->watcher);
-
-    ssize_t r = recv(remote->fd, server->buf->data, BUF_SIZE, 0);
+    ssize_t r = recv(remote->fd, server->buf->data, SOCKET_BUF_SIZE, 0);
 
     if (r == 0) {
         // connection closed
@@ -385,7 +415,7 @@ remote_recv_cb(EV_P_ ev_io *w, int revents)
 
     server->buf->len = r;
 
-    int err = crypto->decrypt(server->buf, server->d_ctx, BUF_SIZE);
+    int err = crypto->decrypt(server->buf, server->d_ctx, SOCKET_BUF_SIZE);
     if (err == CRYPTO_ERROR) {
         LOGE("invalid password or cipher");
         close_and_free_remote(EV_A_ remote);
@@ -448,12 +478,11 @@ remote_send_cb(EV_P_ ev_io *w, int revents)
             ev_io_stop(EV_A_ & remote_send_ctx->io);
             ev_io_stop(EV_A_ & server->recv_ctx->io);
             ev_io_start(EV_A_ & remote->recv_ctx->io);
-            ev_timer_start(EV_A_ & remote->recv_ctx->watcher);
 
             // send destaddr
             buffer_t ss_addr_to_send;
             buffer_t *abuf = &ss_addr_to_send;
-            balloc(abuf, BUF_SIZE);
+            balloc(abuf, SOCKET_BUF_SIZE);
 
             if (AF_INET6 == server->destaddr.ss_family) { // IPv6
                 abuf->data[abuf->len++] = 4;          // Type 4 is IPv6 address
@@ -479,7 +508,7 @@ remote_send_cb(EV_P_ ev_io *w, int revents)
 
             abuf->len += 2;
 
-            int err = crypto->encrypt(abuf, server->e_ctx, BUF_SIZE);
+            int err = crypto->encrypt(abuf, server->e_ctx, SOCKET_BUF_SIZE);
             if (err) {
                 LOGE("invalid password or cipher");
                 bfree(abuf);
@@ -488,7 +517,7 @@ remote_send_cb(EV_P_ ev_io *w, int revents)
                 return;
             }
 
-            err = crypto->encrypt(remote->buf, server->e_ctx, BUF_SIZE);
+            err = crypto->encrypt(remote->buf, server->e_ctx, SOCKET_BUF_SIZE);
             if (err) {
                 LOGE("invalid password or cipher");
                 bfree(abuf);
@@ -497,7 +526,7 @@ remote_send_cb(EV_P_ ev_io *w, int revents)
                 return;
             }
 
-            bprepend(remote->buf, abuf, BUF_SIZE);
+            bprepend(remote->buf, abuf, SOCKET_BUF_SIZE);
             bfree(abuf);
         } else {
             ERROR("getpeername");
@@ -591,7 +620,7 @@ new_remote(int fd, int timeout)
     remote->recv_ctx = ss_malloc(sizeof(remote_ctx_t));
     remote->send_ctx = ss_malloc(sizeof(remote_ctx_t));
     remote->buf      = ss_malloc(sizeof(buffer_t));
-    balloc(remote->buf, BUF_SIZE);
+    balloc(remote->buf, SOCKET_BUF_SIZE);
     memset(remote->recv_ctx, 0, sizeof(remote_ctx_t));
     memset(remote->send_ctx, 0, sizeof(remote_ctx_t));
     remote->fd                  = fd;
@@ -604,8 +633,6 @@ new_remote(int fd, int timeout)
     ev_io_init(&remote->send_ctx->io, remote_send_cb, fd, EV_WRITE);
     ev_timer_init(&remote->send_ctx->watcher, remote_timeout_cb,
                   min(MAX_CONNECT_TIMEOUT, timeout), 0);
-    ev_timer_init(&remote->recv_ctx->watcher, remote_timeout_cb,
-                  timeout, 0);
 
     return remote;
 }
@@ -630,7 +657,6 @@ close_and_free_remote(EV_P_ remote_t *remote)
 {
     if (remote != NULL) {
         ev_timer_stop(EV_A_ & remote->send_ctx->watcher);
-        ev_timer_stop(EV_A_ & remote->recv_ctx->watcher);
         ev_io_stop(EV_A_ & remote->send_ctx->io);
         ev_io_stop(EV_A_ & remote->recv_ctx->io);
         close(remote->fd);
@@ -647,7 +673,7 @@ new_server(int fd)
     server->recv_ctx = ss_malloc(sizeof(server_ctx_t));
     server->send_ctx = ss_malloc(sizeof(server_ctx_t));
     server->buf      = ss_malloc(sizeof(buffer_t));
-    balloc(server->buf, BUF_SIZE);
+    balloc(server->buf, SOCKET_BUF_SIZE);
     memset(server->recv_ctx, 0, sizeof(server_ctx_t));
     memset(server->send_ctx, 0, sizeof(server_ctx_t));
     server->fd                  = fd;
@@ -656,8 +682,8 @@ new_server(int fd)
     server->send_ctx->server    = server;
     server->send_ctx->connected = 0;
 
-    server->e_ctx = ss_align(sizeof(cipher_ctx_t));
-    server->d_ctx = ss_align(sizeof(cipher_ctx_t));
+    server->e_ctx = ss_malloc(sizeof(cipher_ctx_t));
+    server->d_ctx = ss_malloc(sizeof(cipher_ctx_t));
     crypto->ctx_init(crypto->cipher, server->e_ctx, 1);
     crypto->ctx_init(crypto->cipher, server->d_ctx, 0);
 
@@ -733,6 +759,14 @@ accept_cb(EV_P_ ev_io *w, int revents)
     setsockopt(serverfd, SOL_SOCKET, SO_NOSIGPIPE, &opt, sizeof(opt));
 #endif
 
+    if (tcp_incoming_sndbuf > 0) {
+        setsockopt(serverfd, SOL_SOCKET, SO_SNDBUF, &tcp_incoming_sndbuf, sizeof(int));
+    }
+
+    if (tcp_incoming_rcvbuf > 0) {
+        setsockopt(serverfd, SOL_SOCKET, SO_RCVBUF, &tcp_incoming_rcvbuf, sizeof(int));
+    }
+
     int index                    = rand() % listener->remote_num;
     struct sockaddr *remote_addr = listener->remote_addr[index];
 
@@ -762,9 +796,16 @@ accept_cb(EV_P_ ev_io *w, int revents)
     setnonblocking(remotefd);
 
     if (listener->tos >= 0) {
-        if (setsockopt(remotefd, IPPROTO_IP, IP_TOS, &listener->tos, sizeof(listener->tos)) != 0) {
-            ERROR("setsockopt IP_TOS");
+        int rc = setsockopt(remotefd, IPPROTO_IP, IP_TOS, &listener->tos, sizeof(listener->tos));
+        if (rc < 0 && errno != ENOPROTOOPT) {
+            LOGE("setting ipv4 dscp failed: %d", errno);
         }
+#ifdef IPV6_TCLASS
+        rc = setsockopt(remotefd, IPPROTO_IPV6, IPV6_TCLASS, &listener->tos, sizeof(listener->tos));
+        if (rc < 0 && errno != ENOPROTOOPT) {
+            LOGE("setting ipv6 dscp failed: %d", errno);
+        }
+#endif
     }
 
     // Enable MPTCP
@@ -785,6 +826,14 @@ accept_cb(EV_P_ ev_io *w, int revents)
         if (listener->mptcp == 0) {
             ERROR("failed to enable multipath TCP");
         }
+    }
+
+    if (tcp_outgoing_sndbuf > 0) {
+        setsockopt(remotefd, SOL_SOCKET, SO_SNDBUF, &tcp_outgoing_sndbuf, sizeof(int));
+    }
+
+    if (tcp_outgoing_rcvbuf > 0) {
+        setsockopt(remotefd, SOL_SOCKET, SO_RCVBUF, &tcp_outgoing_rcvbuf, sizeof(int));
     }
 
     server_t *server = new_server(serverfd);
@@ -860,12 +909,14 @@ main(int argc, char **argv)
     char *plugin_port = NULL;
     char tmp_port[8];
 
-    int remote_num = 0;
-    ss_addr_t remote_addr[MAX_REMOTE_NUM];
-    char *remote_port = NULL;
-
     int dscp_num    = 0;
     ss_dscp_t *dscp = NULL;
+
+    int remote_num    = 0;
+    char *remote_port = NULL;
+    ss_addr_t remote_addr[MAX_REMOTE_NUM];
+
+    memset(remote_addr, 0, sizeof(ss_addr_t) * MAX_REMOTE_NUM);
 
     static struct option long_options[] = {
         { "fast-open",   no_argument,       NULL, GETOPT_VAL_FAST_OPEN   },
@@ -874,18 +925,22 @@ main(int argc, char **argv)
         { "plugin",      required_argument, NULL, GETOPT_VAL_PLUGIN      },
         { "plugin-opts", required_argument, NULL, GETOPT_VAL_PLUGIN_OPTS },
         { "reuse-port",  no_argument,       NULL, GETOPT_VAL_REUSE_PORT  },
+        { "tcp-incoming-sndbuf", required_argument, NULL, GETOPT_VAL_TCP_INCOMING_SNDBUF },
+        { "tcp-incoming-rcvbuf", required_argument, NULL, GETOPT_VAL_TCP_INCOMING_RCVBUF },
+        { "tcp-outgoing-sndbuf", required_argument, NULL, GETOPT_VAL_TCP_OUTGOING_SNDBUF },
+        { "tcp-outgoing-rcvbuf", required_argument, NULL, GETOPT_VAL_TCP_OUTGOING_RCVBUF },
         { "no-delay",    no_argument,       NULL, GETOPT_VAL_NODELAY     },
         { "password",    required_argument, NULL, GETOPT_VAL_PASSWORD    },
         { "key",         required_argument, NULL, GETOPT_VAL_KEY         },
         { "help",        no_argument,       NULL, GETOPT_VAL_HELP        },
-        { NULL,                          0, NULL,                      0 }
+        { NULL,          0,                 NULL, 0                      }
     };
 
     opterr = 0;
 
     USE_TTY();
 
-    while ((c = getopt_long(argc, argv, "f:s:p:l:k:t:m:c:b:a:n:huUv6A",
+    while ((c = getopt_long(argc, argv, "f:s:p:l:k:t:m:c:b:a:n:huUTv6A",
                             long_options, NULL)) != -1) {
         switch (c) {
         case GETOPT_VAL_FAST_OPEN:
@@ -915,10 +970,21 @@ main(int argc, char **argv)
         case GETOPT_VAL_REUSE_PORT:
             reuse_port = 1;
             break;
+        case GETOPT_VAL_TCP_INCOMING_SNDBUF:
+            tcp_incoming_sndbuf = atoi(optarg);
+            break;
+        case GETOPT_VAL_TCP_INCOMING_RCVBUF:
+            tcp_incoming_rcvbuf = atoi(optarg);
+            break;
+        case GETOPT_VAL_TCP_OUTGOING_SNDBUF:
+            tcp_outgoing_sndbuf = atoi(optarg);
+            break;
+        case GETOPT_VAL_TCP_OUTGOING_RCVBUF:
+            tcp_outgoing_rcvbuf = atoi(optarg);
+            break;
         case 's':
             if (remote_num < MAX_REMOTE_NUM) {
-                remote_addr[remote_num].host   = optarg;
-                remote_addr[remote_num++].port = NULL;
+                parse_addr(optarg, &remote_addr[remote_num++]);
             }
             break;
         case 'p':
@@ -960,6 +1026,9 @@ main(int argc, char **argv)
             break;
         case 'U':
             mode = UDP_ONLY;
+            break;
+        case 'T':
+            tcp_tproxy = 1;
             break;
         case 'v':
             verbose = 1;
@@ -1033,6 +1102,9 @@ main(int argc, char **argv)
         if (mode == TCP_ONLY) {
             mode = conf->mode;
         }
+        if (tcp_tproxy == 0) {
+            tcp_tproxy = conf->tcp_tproxy;
+        }
         if (mtu == 0) {
             mtu = conf->mtu;
         }
@@ -1044,6 +1116,18 @@ main(int argc, char **argv)
         }
         if (reuse_port == 0) {
             reuse_port = conf->reuse_port;
+        }
+        if (tcp_incoming_sndbuf == 0) {
+            tcp_incoming_sndbuf = conf->tcp_incoming_sndbuf;
+        }
+        if (tcp_incoming_rcvbuf == 0) {
+            tcp_incoming_rcvbuf = conf->tcp_incoming_rcvbuf;
+        }
+        if (tcp_outgoing_sndbuf == 0) {
+            tcp_outgoing_sndbuf = conf->tcp_outgoing_sndbuf;
+        }
+        if (tcp_outgoing_rcvbuf == 0) {
+            tcp_outgoing_rcvbuf = conf->tcp_outgoing_rcvbuf;
         }
         if (fast_open == 0) {
             fast_open = conf->fast_open;
@@ -1072,14 +1156,18 @@ main(int argc, char **argv)
             FATAL("failed to find a free port");
         }
         snprintf(tmp_port, 8, "%d", port);
-        plugin_host = "127.0.0.1";
+        if (is_ipv6only(remote_addr, remote_num, ipv6first)) {
+            plugin_host = "::1";
+        } else {
+            plugin_host = "127.0.0.1";
+        }
         plugin_port = tmp_port;
 
         LOGI("plugin \"%s\" enabled", plugin);
     }
 
     if (method == NULL) {
-        method = "rc4-md5";
+        method = "chacha20-ietf-poly1305";
     }
 
     if (timeout == NULL) {
@@ -1100,7 +1188,11 @@ main(int argc, char **argv)
 #endif
 
     if (local_addr == NULL) {
-        local_addr = "127.0.0.1";
+        if (is_ipv6only(remote_addr, remote_num, ipv6first)) {
+            local_addr = "::1";
+        } else {
+            local_addr = "127.0.0.1";
+        }
     }
 
     if (fast_open == 1) {
@@ -1123,6 +1215,38 @@ main(int argc, char **argv)
 
     if (ipv6first) {
         LOGI("resolving hostname to IPv6 address first");
+    }
+
+    if (tcp_incoming_sndbuf != 0 && tcp_incoming_sndbuf < SOCKET_BUF_SIZE) {
+        tcp_incoming_sndbuf = 0;
+    }
+
+    if (tcp_incoming_sndbuf != 0) {
+        LOGI("set TCP incoming connection send buffer size to %d", tcp_incoming_sndbuf);
+    }
+
+    if (tcp_incoming_rcvbuf != 0 && tcp_incoming_rcvbuf < SOCKET_BUF_SIZE) {
+        tcp_incoming_rcvbuf = 0;
+    }
+
+    if (tcp_incoming_rcvbuf != 0) {
+        LOGI("set TCP incoming connection receive buffer size to %d", tcp_incoming_rcvbuf);
+    }
+
+    if (tcp_outgoing_sndbuf != 0 && tcp_outgoing_sndbuf < SOCKET_BUF_SIZE) {
+        tcp_outgoing_sndbuf = 0;
+    }
+
+    if (tcp_outgoing_sndbuf != 0) {
+        LOGI("set TCP outgoing connection send buffer size to %d", tcp_outgoing_sndbuf);
+    }
+
+    if (tcp_outgoing_rcvbuf != 0 && tcp_outgoing_rcvbuf < SOCKET_BUF_SIZE) {
+        tcp_outgoing_rcvbuf = 0;
+    }
+
+    if (tcp_outgoing_rcvbuf != 0) {
+        LOGI("set TCP outgoing connection receive buffer size to %d", tcp_outgoing_rcvbuf);
     }
 
     if (plugin != NULL) {
@@ -1256,6 +1380,10 @@ main(int argc, char **argv)
     if (plugin != NULL) {
         stop_plugin();
     }
+
+    for (i = 0; i < remote_num; i++)
+        ss_free(listen_ctx.remote_addr[i]);
+    ss_free(listen_ctx.remote_addr);
 
     return ret_val;
 }
